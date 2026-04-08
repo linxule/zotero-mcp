@@ -15,6 +15,19 @@ Upstream's `GeminiEmbeddingFunction` and `create_chroma_client` had enough laten
 - Upstream tracking via the `upstream` remote for future rebases
 - A place to land follow-ups without wrestling patch-apply tooling
 
+## Running tests
+
+```bash
+# All semantic-search tests (38 total) — fast, hermetic
+uv run --extra dev pytest tests/test_semantic_search_quality.py \
+    tests/test_v021_fixes.py tests/test_semantic_stats.py
+
+# Just the v2-specific test class added in this fork
+uv run --extra dev pytest tests/test_semantic_search_quality.py::TestGeminiV2Support -v
+```
+
+First run installs `[dev]` extras (chromadb, sentence-transformers, torch, etc.) — takes a few minutes. Subsequent runs are sub-second.
+
 ## What we changed vs upstream v0.2.2
 
 9 commits on `fix/gemini-embedding-2-preview-bundle`, 9 logical fixes plus a test commit. See commit messages for full rationale and empirical evidence.
@@ -143,14 +156,14 @@ Hit twice during recovery attempts, seemingly random (one compaction error, one 
 
 ChromaDB stores EF config via `get_config()` which returns `{model_name, base_url}` — no `api_key`. So during rehydration, `build_from_config(stored_config)` gets a dict without `api_key` regardless of our fix. The constructor falls back to env vars. Fix 7 only helps direct callers who pass a dict with `api_key` explicitly. Kept for symmetry; not load-bearing.
 
-### Two distinct things named `zotero-mcp` in this environment
+### Two distinct things named `zotero-mcp` in this environment (historical)
 
-Be careful — there are TWO different MCP servers named `zotero-mcp` wired into different configs:
+There used to be TWO different MCP servers named `zotero-mcp` referenced in this environment. As of 2026-04-08 only one is real:
 
-1. **Python `54yyyu/zotero-mcp`** (this fork): installed via `uv tool install`, executable at `~/.local/bin/zotero-mcp`. Wired into `seams/.mcp.json` as `command: "zotero-mcp"` (bare command, PATH-resolved). This is what we work on.
-2. **JavaScript `zotero-mcp` (npm package)**: a completely different upstream, lives in `~/Documents/Apps/mcp/zotero-mcp/node_modules/zotero-mcp/`. Wired into `mcp/claude_desktop_config.json` and `mcp/global-mcp-config.json` as `command: bun, args: [.../node_modules/zotero-mcp/build/index.js]`. Our reinstall does NOT affect this one.
+1. **Python `54yyyu/zotero-mcp`** (this fork): installed via `uv tool install`, executable at `~/.local/bin/zotero-mcp`. Wired into `seams/.mcp.json` as `command: "zotero-mcp"` (bare command, PATH-resolved). **This is the only active one — `uv tool list` confirms it's the only zotero-mcp on this machine.**
+2. **JavaScript `zotero-mcp` (npm package)** [historical, no longer present]: a completely different upstream that used to live at `~/Documents/Apps/mcp/zotero-mcp/node_modules/zotero-mcp/`. The directory had been deleted before today's session even started. The two `mcp-workspace` config files that still referenced it (`claude_desktop_config.json`, `global-mcp-config.json`) were updated 2026-04-08 to point at the Python fork instead — see `linxule/mcp-workspace@58d3f82`. No global `bun` or `npm` install for it either.
 
-If you ever have search or embedding behavior that surprises you, check which one is actually being invoked by the active project's MCP config. They are not interchangeable — different feature sets, different bugs.
+Lesson kept here as a tripwire: search/embedding behavior surprises were sometimes traceable to invoking the wrong "zotero-mcp" — always check which one a given MCP config wires up. If you ever find a config still calling `bun .../zotero-mcp/build/index.js`, it's stale and should be updated to bare `zotero-mcp`.
 
 ## User-facing config
 
@@ -178,7 +191,7 @@ Global: `~/.config/zotero-mcp/config.json`
 }
 ```
 
-Project-scoped `.mcp.json` in `seams` and `interpretive-orchestration` also sets `GEMINI_EMBEDDING_MODEL=models/gemini-embedding-2-preview` as a belt-and-suspenders override.
+Project-scoped `.mcp.json` in `seams` also sets `GEMINI_EMBEDDING_MODEL=models/gemini-embedding-2-preview` as a belt-and-suspenders override (the old `interpretive-orchestration` project that used to also set this has been deleted).
 
 ## Upstream PRs
 
@@ -208,6 +221,7 @@ gh pr view 205 --repo 54yyyu/zotero-mcp
 
 ## Related
 
-- Memex memo: `projects/zotero-mcp/memos/2026-04-08-fork-with-gemini-embedding-2-preview-support.md` — full debugging journey, root cause analysis, methodology notes
+- Memex memo: `projects/zotero-mcp/memos/2026-04-08-fork-with-gemini-embedding-2-preview-support.md` — original fork creation: full debugging journey, root cause analysis, methodology notes
+- Memex memo: `projects/zotero-mcp/memos/2026-04-08-upstream-prs-and-codex-truncation-catch.md` — upstream PR submission session: Codex caught a cross-branch truncation gap, added recovered_items fix, opened #204 and #205
 - Session context lives in mcp monorepo's global `/memory/` index
 - Related deferred follow-up: `projects/mineru-mcp/memos/2026-04-08-mineru-zotero-integration-architecture.md` — the reason we're on this model upgrade path in the first place
