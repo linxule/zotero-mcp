@@ -17,7 +17,7 @@ Upstream's `GeminiEmbeddingFunction` and `create_chroma_client` had enough laten
 
 ## What we changed vs upstream v0.2.2
 
-6 commits on `fix/gemini-embedding-2-preview-bundle`, 8 logical fixes. See commit messages for full rationale and empirical evidence.
+9 commits on `fix/gemini-embedding-2-preview-bundle`, 9 logical fixes plus a test commit. See commit messages for full rationale and empirical evidence.
 
 | Commit | Scope | File(s) |
 |---|---|---|
@@ -27,18 +27,28 @@ Upstream's `GeminiEmbeddingFunction` and `create_chroma_client` had enough laten
 | `fix(semantic_search): pass _failed_docs through to _process_item_batch` | Latent scope bug — `_failed_docs` defined in `update_database` but referenced in `_process_item_batch`, causing `NameError` on every transient ChromaDB upsert failure | `semantic_search.py` |
 | `fix(chroma): propagate api_key through build_from_config rehydration` | Both `GeminiEmbeddingFunction.build_from_config` and `OpenAIEmbeddingFunction.build_from_config` dropped `api_key` | `chroma_client.py` |
 | `fix(gemini): reserve v2 prefix token budget in effective max_input_tokens` | Formal correctness: extract v2 prefixes to class constants, reserve `V2_PREFIX_TOKEN_BUDGET = 20`, derive effective `max_input_tokens = 7980` so post-prefix payload is formally bounded under 8192 hard cap | `chroma_client.py` |
+| `fix(semantic_search): track recovered items in their own stats bucket` | Once the `_failed_docs` fix makes the retry path live, a previously-dormant misclassification becomes visible: every recovered doc was counted as `added_items += 1` regardless of original add/update classification. Introduces `stats["recovered_items"]` bucket; appends "recovered" to the end-of-run summary. Includes 3 unit tests. | `semantic_search.py`, `tests/test_semantic_stats.py` |
+| `test(gemini): cover gemini-embedding-2-preview paths` | Adds `TestGeminiV2Support` with 5 tests: v2 `__call__` prefix routing, v2 `embed_query` prefix routing, query truncation before prefixing, batch ordering preservation across `GEMINI_MAX_BATCH=100` chunks, and pinning of `V2_PREFIX_TOKEN_BUDGET=20` and `_is_v2()` detection. | `tests/test_semantic_search_quality.py` |
+| `docs: add CLAUDE.md for fork maintenance context` | This file. | `CLAUDE.md` |
 
-Total diff vs upstream: `chroma_client.py +178 -52`, `semantic_search.py +29 -5`.
+Total diff vs upstream: `chroma_client.py +170 -52`, `semantic_search.py +43 -5`, `tests/test_semantic_search_quality.py +166`, `tests/test_semantic_stats.py +96`.
+
+Test count: 38 (was 30 in upstream baseline, +5 v2 tests, +3 recovered_items tests).
 
 ## Installing this fork as the active runtime
 
 ```bash
-# From anywhere
-uv tool install --force --from /Users/xulelin/Documents/Apps/zotero-mcp 'zotero-mcp-server[all]'
+# From anywhere. The --with form is required because uv tool install
+# rejects the bracketed-extras spec with --from in current uv versions.
+uv tool install --force --with 'zotero-mcp-server[all]' \
+    --from /Users/xulelin/Documents/Apps/zotero-mcp zotero-mcp-server
 
 # Verify
 zotero-mcp version  # should show 0.2.2
-python3 -c "from zotero_mcp.chroma_client import GeminiEmbeddingFunction as F; print(F.V2_PREFIX_TOKEN_BUDGET, F.V2_DOC_PREFIX)"
+uv tool run --from zotero-mcp-server python3 -c "
+from zotero_mcp.chroma_client import GeminiEmbeddingFunction as F
+print(F.V2_PREFIX_TOKEN_BUDGET, repr(F.V2_DOC_PREFIX))
+"
 # expected: 20 'Represent this document for retrieval:\n\n'
 ```
 
@@ -46,8 +56,11 @@ After this, `uv tool upgrade zotero-mcp-server` will pull from PyPI and **wipe o
 
 ```bash
 cd /Users/xulelin/Documents/Apps/zotero-mcp && git pull origin fix/gemini-embedding-2-preview-bundle
-uv tool install --force --from /Users/xulelin/Documents/Apps/zotero-mcp 'zotero-mcp-server[all]'
+uv tool install --force --with 'zotero-mcp-server[all]' \
+    --from /Users/xulelin/Documents/Apps/zotero-mcp zotero-mcp-server
 ```
+
+This replaces the executable at `~/.local/bin/zotero-mcp`. Any Claude Code MCP config that points at the bare command `zotero-mcp` (or `~/.local/bin/zotero-mcp`) will pick up the new runtime on next launch — no settings changes needed. **If** an MCP config uses `uvx zotero-mcp-server` or similar, it would re-fetch from PyPI on each run and bypass the fork — those should be changed to call `zotero-mcp` directly.
 
 ## Keeping up with upstream
 
@@ -130,6 +143,15 @@ Hit twice during recovery attempts, seemingly random (one compaction error, one 
 
 ChromaDB stores EF config via `get_config()` which returns `{model_name, base_url}` — no `api_key`. So during rehydration, `build_from_config(stored_config)` gets a dict without `api_key` regardless of our fix. The constructor falls back to env vars. Fix 7 only helps direct callers who pass a dict with `api_key` explicitly. Kept for symmetry; not load-bearing.
 
+### Two distinct things named `zotero-mcp` in this environment
+
+Be careful — there are TWO different MCP servers named `zotero-mcp` wired into different configs:
+
+1. **Python `54yyyu/zotero-mcp`** (this fork): installed via `uv tool install`, executable at `~/.local/bin/zotero-mcp`. Wired into `seams/.mcp.json` as `command: "zotero-mcp"` (bare command, PATH-resolved). This is what we work on.
+2. **JavaScript `zotero-mcp` (npm package)**: a completely different upstream, lives in `~/Documents/Apps/mcp/zotero-mcp/node_modules/zotero-mcp/`. Wired into `mcp/claude_desktop_config.json` and `mcp/global-mcp-config.json` as `command: bun, args: [.../node_modules/zotero-mcp/build/index.js]`. Our reinstall does NOT affect this one.
+
+If you ever have search or embedding behavior that surprises you, check which one is actually being invoked by the active project's MCP config. They are not interchangeable — different feature sets, different bugs.
+
 ## User-facing config
 
 Global: `~/.config/zotero-mcp/config.json`
@@ -158,18 +180,31 @@ Global: `~/.config/zotero-mcp/config.json`
 
 Project-scoped `.mcp.json` in `seams` and `interpretive-orchestration` also sets `GEMINI_EMBEDDING_MODEL=models/gemini-embedding-2-preview` as a belt-and-suspenders override.
 
-## Upstream PR strategy (deferred)
+## Upstream PRs
 
-All 6 commits are structured as PR-sized units. When/if you want to upstream:
+Two PRs open against `54yyyu/zotero-mcp:main` as of 2026-04-08:
 
-1. **PR A — gemini-embedding-2-preview support** (commit `b1a3afe` — Fixes 1+2+3 bundled, they are interdependent)
-2. **PR B — embed_query truncation** (commit `26d1e38` — Fix 4)
-3. **PR C — config.json precedence** (commit `48d746e` — Fix 5, applies to both openai and gemini branches)
-4. **PR D — _failed_docs scope** (commit `02af54b` — Fix 6)
-5. **PR E — build_from_config api_key passthrough** (commit `59f0cb9` — Fix 7)
-6. **PR F — v2 prefix token budget** (commit `dca16da` — Fix 8, depends on PR A)
+- **#204 — `fix: bundle of latent bug fixes uncovered during semantic reindex`**
+  Branch: `upstream-pr/latent-fixes` (5 commits, 33 tests). Bundles config merge,
+  `_failed_docs` scope, `build_from_config` api_key, `embed_query` truncation,
+  and `recovered_items` stats classification.
 
-Each PR body should include the commit message verbatim — they're written to stand alone.
+- **#205 — `feat(gemini): support gemini-embedding-2-preview + batched embedding`**
+  Branch: `upstream-pr/gemini-v2-support` (4 commits, 35 tests). Bundles the v2
+  feature work, prefix token budget reservation, query truncation (duplicated
+  from #204 so each PR is self-contained), and 5 new `TestGeminiV2Support` tests.
+
+Both PRs cherry-pick from this fork onto `upstream/main` and were reviewed by
+Claude `code-reviewer` and OpenAI Codex (GPT-5.4) before submission. The
+`embed_query` truncation fix appears in both PRs because each is structured to
+be self-contained — when one merges the other will rebase trivially since the
+diff is identical.
+
+To check status:
+```bash
+gh pr view 204 --repo 54yyyu/zotero-mcp
+gh pr view 205 --repo 54yyyu/zotero-mcp
+```
 
 ## Related
 
